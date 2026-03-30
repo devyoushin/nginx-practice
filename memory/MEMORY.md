@@ -1,0 +1,1 @@
+- [nginx-practice project](project_nginx_study.md) — AL2023 RPM 설치 환경 nginx deep-dive 학습 프로젝트, 23개 문서 완성

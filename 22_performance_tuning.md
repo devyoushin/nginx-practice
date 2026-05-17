@@ -14,14 +14,67 @@ cat /proc/sys/fs/file-max
 # 시스템 전체 한계 늘리기
 echo "fs.file-max = 2097152" | sudo tee -a /etc/sysctl.conf
 sudo sysctl -p
+```
 
-# nginx 프로세스별 한계 (/etc/security/limits.conf)
-sudo tee -a /etc/security/limits.conf << 'EOF'
-nginx soft nofile 65535
-nginx hard nofile 65535
-root  soft nofile 65535
-root  hard nofile 65535
-EOF
+#### systemd로 기동할 때: LimitNOFILE 설정
+
+> **주의**: systemd로 기동하는 서비스는 `/etc/security/limits.conf`가 **적용되지 않는다.**
+> 반드시 systemd 유닛 파일에 `LimitNOFILE=`을 직접 설정해야 한다.
+
+```bash
+# nginx systemd 유닛 파일에 drop-in 설정 추가
+sudo systemctl edit nginx
+```
+
+```ini
+# /etc/systemd/system/nginx.service.d/override.conf
+[Service]
+LimitNOFILE=65536
+# soft=65536, hard=1048576으로 분리 설정도 가능
+# LimitNOFILE=65536:1048576
+```
+
+```bash
+# 설정 적용
+sudo systemctl daemon-reload
+sudo systemctl restart nginx
+
+# 적용 확인 (nginx master PID 기준)
+cat /proc/$(cat /var/run/nginx.pid)/limits | grep "open files"
+```
+
+#### 적정값 계산 방법
+
+`LimitNOFILE`은 nginx.conf의 `worker_processes × worker_connections × 2`보다 커야 한다.
+클라이언트 소켓 + upstream 소켓을 동시에 열기 때문에 연결 1개당 fd 2개를 소비한다.
+
+```
+worker_processes 4  ×  worker_connections 4096  ×  2 = 32768  →  65536이면 충분
+worker_processes 8  ×  worker_connections 10240 ×  2 = 163840 →  65536이면 부족, 262144 이상 필요
+```
+
+| 트래픽 규모 | worker_connections | 권장 LimitNOFILE |
+|-------------|-------------------|-----------------|
+| 소규모       | 1024              | 65536           |
+| 중규모       | 4096              | 65536           |
+| 대규모       | 10240             | 262144          |
+| 초대규모     | 65535             | 1048576         |
+
+#### nginx.conf의 worker_rlimit_nofile과의 관계
+
+```nginx
+# nginx.conf (main context)
+worker_rlimit_nofile 65536;
+# → nginx가 자체적으로 worker 프로세스의 fd 한도를 설정
+# → LimitNOFILE 값보다 클 수 없음 (LimitNOFILE가 상한선)
+```
+
+```bash
+# 현재 실제 fd 사용량 확인 (worker 프로세스 전체)
+for pid in $(pgrep nginx); do
+  echo -n "PID $pid ($(cat /proc/$pid/comm)): "
+  ls /proc/$pid/fd 2>/dev/null | wc -l
+done
 ```
 
 ### TCP 튜닝

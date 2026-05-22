@@ -182,6 +182,199 @@ error_log  syslog:server=unix:/dev/log,nohostname warn;
 `kill -USR1`은 nginx에게 로그 파일 재오픈(reopen) 신호를 보냅니다.
 이를 통해 로테이션 후 새 파일에 계속 기록할 수 있습니다.
 
+### 운영 권장안
+
+access log는 트래픽이 많으면 가장 빠르게 디스크를 채우는 파일입니다.
+기본 방향은 **짧은 로컬 보관 + 압축 + 필요 시 외부 저장소 전송**입니다.
+
+권장 기준:
+
+| 상황 | 권장 설정 |
+|------|----------|
+| 일반 웹/API 서버 | `daily`, `rotate 14~30`, `compress`, `delaycompress` |
+| 트래픽 많은 서버 | `daily` + `maxsize 100M~1G`, `rotate 7~14` |
+| 감사/보안 요구 있음 | 로컬 7~30일 + S3/로그 플랫폼 장기 보관 |
+| 디스크가 작음 | `rotate 7`, `maxage 7`, `maxsize 100M`, 적극적 조건부 로깅 |
+| 컨테이너 환경 | 파일 로그보다 stdout/stderr + 런타임 로그 정책 사용 |
+
+실무에서 무난한 예시:
+
+```conf
+/var/log/nginx/*.log {
+    daily
+    maxsize 500M
+    rotate 14
+    missingok
+    notifempty
+    compress
+    delaycompress
+    dateext
+    dateformat -%Y%m%d
+    create 640 nginx adm
+    sharedscripts
+    postrotate
+        if [ -f /run/nginx.pid ]; then
+            kill -USR1 `cat /run/nginx.pid`
+        elif [ -f /var/run/nginx.pid ]; then
+            kill -USR1 `cat /var/run/nginx.pid`
+        fi
+    endscript
+}
+```
+
+핵심 옵션:
+
+| 옵션 | 의미 |
+|------|------|
+| `daily` | 하루 단위로 회전 |
+| `maxsize 500M` | 일 단위 회전 전이라도 500MB를 넘으면 회전 대상 |
+| `rotate 14` | 압축된 과거 로그를 14개 보관 |
+| `compress` | 과거 로그 gzip 압축 |
+| `delaycompress` | 직전 로그는 다음 회전 때 압축 |
+| `dateext` | `access.log-20240522.gz` 형태로 날짜 suffix 사용 |
+| `notifempty` | 빈 로그 파일은 회전하지 않음 |
+| `missingok` | 로그 파일이 없어도 에러 처리하지 않음 |
+| `create 640 nginx adm` | 새 로그 파일 권한/소유자 지정 |
+| `sharedscripts` | 여러 로그 파일이 매칭되어도 `postrotate`는 한 번만 실행 |
+
+주의할 점:
+
+- `copytruncate`는 nginx에는 보통 사용하지 않습니다. 복사 후 파일을 자르는 동안 로그 유실 가능성이 있습니다.
+- nginx는 열린 파일 디스크립터에 계속 쓰므로, 회전 후 반드시 `USR1` 신호나 `nginx -s reopen`으로 로그 파일을 다시 열어야 합니다.
+- 여기서 `kill -USR1`의 `kill`은 프로세스를 종료한다는 뜻이 아니라, nginx master process에 시그널을 보내는 명령입니다.
+- `size`는 시간 기준(`daily`, `weekly` 등)과 조합 의도가 헷갈릴 수 있습니다. "매일 돌리되 너무 크면 더 빨리 회전"이 목적이면 `maxsize`를 사용합니다.
+- logrotate가 하루 한 번만 실행되면 용량 조건도 하루 한 번만 판단합니다. 초고트래픽이면 logrotate 실행 주기(systemd timer/cron)도 같이 확인합니다.
+- `rotate`만 믿지 말고 디스크 여유가 작은 서버는 `maxage`, `maxsize`도 함께 검토합니다.
+
+### nginx와 Tomcat 로그 회전 차이
+
+nginx 예시에서 자주 보이는 아래 명령은 nginx를 죽이는 명령이 아닙니다.
+
+```bash
+kill -USR1 $(cat /run/nginx.pid)
+```
+
+`kill` 명령으로 `USR1` 시그널을 보내면 nginx master process는 로그 파일을 다시 엽니다.
+logrotate가 기존 `access.log`를 날짜가 붙은 파일로 바꾸고 새 `access.log`를 만든 뒤, nginx가 새 파일에 쓰도록 전환하는 절차입니다.
+
+흐름:
+
+```text
+1. nginx가 /var/log/nginx/access.log 파일을 열고 계속 기록
+2. logrotate가 access.log를 access.log-20260522 같은 이름으로 변경
+3. logrotate가 새 access.log 파일 생성
+4. nginx master process에 USR1 시그널 전송
+5. nginx가 로그 파일을 close/reopen
+6. 이후 로그는 새 access.log에 기록
+```
+
+Tomcat 같은 JVM 애플리케이션은 보통 방식이 다릅니다.
+로그 파일 회전은 OS의 logrotate보다 JVM 내부 로깅 프레임워크가 처리하는 경우가 많습니다.
+
+대표 예:
+
+- Logback `RollingFileAppender`
+- Log4j2 `RollingFile`
+- java.util.logging
+- Tomcat JULI/Catalina logging
+
+비교:
+
+| 구분 | nginx | Tomcat/JVM |
+|------|-------|------------|
+| 로그 작성 주체 | nginx master/worker | JVM 로깅 프레임워크 |
+| 흔한 회전 방식 | OS logrotate + nginx reopen | Logback/Log4j2 등 내부 rolling |
+| PID 시그널 | `USR1`로 로그 파일 재오픈 | 보통 사용하지 않음 |
+| `kill -USR1` 의미 | 종료가 아니라 reopen 지시 | 일반적인 운영 방식 아님 |
+| 주의점 | reopen 없으면 이전 파일에 계속 쓸 수 있음 | 외부 logrotate의 `copytruncate`는 유실 가능성 있음 |
+
+정리하면 nginx는 외부 logrotate가 파일을 바꾼 뒤 nginx에게 "로그 파일 다시 열어라"라고 알려줘야 하고,
+Tomcat/JVM은 애플리케이션 내부 로깅 설정에서 날짜/크기 기준으로 직접 rolling하는 구성이 일반적입니다.
+
+디스크 보호를 더 강하게 걸고 싶을 때:
+
+```conf
+/var/log/nginx/*.log {
+    daily
+    maxsize 200M
+    maxage 14
+    rotate 14
+    missingok
+    notifempty
+    compress
+    delaycompress
+    dateext
+    create 640 nginx adm
+    sharedscripts
+    postrotate
+        nginx -s reopen
+    endscript
+}
+```
+
+### access log 폭증 줄이는 방법
+
+logrotate는 쌓인 파일을 정리하는 장치이고, 로그량 자체를 줄이지는 않습니다.
+로그가 너무 많이 쌓이면 아래 설정을 같이 적용합니다.
+
+헬스 체크, 정적 파일 로그 제외:
+
+```nginx
+map $request_uri $loggable_uri {
+    ~^/(health|ping)$ 0;
+    default 1;
+}
+
+map $uri $loggable_static {
+    ~*\.(css|js|jpg|jpeg|png|gif|ico|svg|woff|woff2)$ 0;
+    default 1;
+}
+
+map "$loggable_uri:$loggable_static" $access_loggable {
+    "1:1" 1;
+    default 0;
+}
+
+access_log /var/log/nginx/access.log main if=$access_loggable;
+```
+
+성공 요청은 샘플링하고 에러는 모두 남기는 방식:
+
+```nginx
+split_clients "$remote_addr$request_uri" $sampled {
+    10%     1;
+    *       0;
+}
+
+map $status $must_log {
+    ~^[45]  1;
+    default $sampled;
+}
+
+access_log /var/log/nginx/access.log main if=$must_log;
+```
+
+버퍼링으로 디스크 I/O 줄이기:
+
+```nginx
+access_log /var/log/nginx/access.log main buffer=64k flush=5s;
+```
+
+### 보관 정책 예시
+
+운영 문서에는 아래처럼 기준을 숫자로 고정해두는 것이 좋습니다.
+
+```text
+access.log 보관 정책
+- 로컬 원본 로그: 현재 파일만 유지
+- 로컬 압축 로그: 14일 보관
+- 회전 기준: 매일 또는 500MB 초과
+- 압축: gzip, 직전 로그는 다음 회전 때 압축
+- 장기 보관: 필요한 경우 S3/CloudWatch/OpenSearch 등 외부 저장소에 90일 이상 보관
+- 제외 대상: /health, /ping, 정적 파일 요청
+- 필수 기록 대상: 4xx/5xx, 느린 요청, 관리자/결제/인증 관련 경로
+```
+
 수동 실행:
 
 ```bash

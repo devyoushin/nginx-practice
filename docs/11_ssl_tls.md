@@ -18,6 +18,135 @@ server {
 
 ---
 
+## TLS termination 위치
+
+nginx는 SSL/TLS 인증서를 직접 적용할 수 있습니다.
+하지만 실무에서는 nginx 앞단의 WAF, CDN, API Gateway, Load Balancer에서 TLS를 먼저 종료하고 nginx로 넘기는 구조도 매우 흔합니다.
+
+대표 구조:
+
+```text
+# nginx가 직접 TLS 종료
+Client --HTTPS--> Nginx --HTTP--> App
+
+# 앞단에서 TLS 종료
+Client --HTTPS--> WAF / CDN / API Gateway / Load Balancer --HTTP--> Nginx --HTTP--> App
+
+# 앞단에서 TLS 종료 후 내부 구간 재암호화
+Client --HTTPS--> WAF / CDN / API Gateway / Load Balancer --HTTPS--> Nginx --HTTP--> App
+```
+
+용어:
+
+| 용어 | 의미 |
+|------|------|
+| TLS termination | HTTPS 연결을 복호화하고 HTTP 요청으로 처리하는 지점 |
+| Edge termination | 사용자와 가장 가까운 WAF/CDN/LB/API Gateway에서 TLS 종료 |
+| Re-encryption | 앞단에서 TLS를 종료한 뒤, 내부 nginx로 다시 HTTPS 연결 |
+| End-to-end TLS | Client부터 App 근처까지 구간별로 계속 TLS 사용 |
+
+앞단에서 TLS termination을 하는 이유:
+
+- WAF가 HTTP 요청 내용을 확인해야 공격 패턴을 검사할 수 있습니다.
+- API Gateway가 인증, 인가, rate limit, 라우팅, JWT 검증 등을 처리할 수 있습니다.
+- 인증서 발급/갱신/교체를 한 곳에서 관리하기 쉽습니다.
+- 여러 nginx/app 서버마다 인증서를 배포하지 않아도 됩니다.
+- TLS 정책, cipher, HTTP/2, HTTP/3 설정을 중앙에서 통제할 수 있습니다.
+
+어느 위치에서 TLS를 종료할지는 보안 경계와 운영 방식에 따라 결정합니다.
+
+| 구조 | 장점 | 주의점 |
+|------|------|--------|
+| 앞단 TLS 종료 후 nginx는 HTTP | 단순하고 운영이 편함 | 내부망 신뢰가 전제됨 |
+| 앞단 TLS 종료 후 nginx까지 HTTPS | 내부 구간도 암호화 가능 | nginx에도 인증서/신뢰 설정 필요 |
+| nginx가 직접 TLS 종료 | nginx 단독 운영에 단순함 | WAF/API Gateway 앞단 정책과 역할 중복 가능 |
+
+---
+
+## 앞단에서 TLS 종료 시 nginx 설정
+
+WAF/API Gateway/LB가 HTTPS를 종료하고 nginx로 HTTP 요청을 넘기면 nginx에는 `ssl_certificate`가 필요하지 않을 수 있습니다.
+대신 원래 요청이 HTTPS였는지, 실제 클라이언트 IP가 무엇인지 전달받는 헤더 처리가 중요합니다.
+
+앞단이 보통 전달하는 헤더:
+
+```text
+X-Forwarded-Proto: https
+X-Forwarded-For: 203.0.113.10
+X-Forwarded-Host: example.com
+X-Real-IP: 203.0.113.10
+```
+
+nginx reverse proxy 예시:
+
+```nginx
+server {
+    listen 80;
+    server_name example.com;
+
+    location / {
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-Proto $http_x_forwarded_proto;
+        proxy_set_header X-Forwarded-Host $host;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Real-IP $remote_addr;
+
+        proxy_pass http://app_backend;
+    }
+}
+```
+
+주의할 점은 `X-Forwarded-*` 헤더를 아무 요청에서나 믿으면 안 된다는 것입니다.
+nginx가 인터넷에 직접 노출되어 있으면 사용자가 임의로 `X-Forwarded-Proto: https` 또는 가짜 IP를 보낼 수 있습니다.
+
+앞단 프록시 IP만 신뢰하도록 `real_ip`를 설정합니다.
+
+```nginx
+http {
+    # WAF / LB / API Gateway의 내부 IP 대역만 신뢰
+    set_real_ip_from 10.0.0.0/8;
+    set_real_ip_from 172.16.0.0/12;
+    set_real_ip_from 192.168.0.0/16;
+
+    real_ip_header X-Forwarded-For;
+    real_ip_recursive on;
+}
+```
+
+애플리케이션이 HTTPS 여부를 알아야 하는 경우, 앞단에서 받은 proto 값을 그대로 전달합니다.
+
+```nginx
+proxy_set_header X-Forwarded-Proto $http_x_forwarded_proto;
+```
+
+단, nginx가 직접 외부 요청을 받는 구조라면 아래처럼 고정하는 편이 안전합니다.
+
+```nginx
+# HTTPS server block 내부
+proxy_set_header X-Forwarded-Proto https;
+
+# HTTP server block 내부
+proxy_set_header X-Forwarded-Proto http;
+```
+
+앞단 TLS termination 구조에서는 HTTP에서 HTTPS로 리디렉션을 nginx가 담당하지 않는 경우도 많습니다.
+WAF/API Gateway/LB에서 이미 HTTPS 강제 리디렉션을 하고 있다면 nginx의 80번 리디렉션 설정은 중복될 수 있습니다.
+
+정리:
+
+```text
+nginx가 직접 TLS 종료:
+- nginx에 ssl_certificate / ssl_certificate_key 설정
+- HTTP -> HTTPS 리디렉션도 nginx에서 처리 가능
+
+앞단에서 TLS 종료:
+- nginx에는 인증서가 없을 수 있음
+- X-Forwarded-Proto, X-Forwarded-For, real_ip 신뢰 설정이 중요
+- HTTPS 리디렉션은 앞단에서 처리하는 경우가 많음
+```
+
+---
+
 ## 인증서 종류별 파일 준비
 
 ### Let's Encrypt (Certbot)
@@ -126,6 +255,9 @@ server {
 ---
 
 ## HTTP → HTTPS 리디렉션
+
+nginx가 직접 외부 HTTP 요청을 받는 경우에는 80번 포트에서 HTTPS로 리디렉션합니다.
+앞단 WAF/API Gateway/LB에서 이미 HTTPS 강제 리디렉션을 처리한다면 nginx 설정과 중복되지 않게 역할을 나눕니다.
 
 ```nginx
 # 방법 1: return (권장, 빠름)

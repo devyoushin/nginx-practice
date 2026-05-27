@@ -29,6 +29,7 @@ Amazon Linux 2023 환경 기준의 Nginx 완전 분석 문서입니다.
 | [21_variables.md](docs/21_variables.md) | 내장 변수 전체 목록 및 활용법 |
 | [22_performance_tuning.md](docs/22_performance_tuning.md) | OS 튜닝, worker 설정, sendfile, TCP 최적화 |
 | [23_monitoring.md](docs/23_monitoring.md) | stub_status, 로그 분석, Prometheus 연동 |
+| [24_practical_tuning_and_split_conf.md](docs/24_practical_tuning_and_split_conf.md) | 실전 성능 최적화, upstream keepalive, conf 파일 분리 예시 |
 
 ## 빠른 참고
 

@@ -531,7 +531,7 @@ access_log /var/log/nginx/access.log main buffer=64k flush=5s;
 - 4xx/5xx와 느린 요청은 반드시 기록
 - logrotate 압축/보관 기간 설정
 
-자세한 내용은 [13_logging.md](13_logging.md)를 참고합니다.
+자세한 내용은 [13_logging.md](../operations/13_logging.md)를 참고합니다.
 
 ---
 

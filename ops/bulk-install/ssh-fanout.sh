@@ -57,8 +57,8 @@ if [ ! -f "${SCRIPT}" ]; then
   exit 1
 fi
 
-while IFS= read -r host; do
-  case "${host}" in
+while read -r host _rest; do
+  case "${host:-}" in
     ""|\#*) continue ;;
   esac
 

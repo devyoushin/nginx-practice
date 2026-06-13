@@ -1,5 +1,5 @@
-# one host per line
+# host group node_id
 # blank lines and lines starting with # are ignored
-10.0.1.10
-10.0.1.11
-10.0.1.12
+10.0.1.10 edge nginx-edge-a
+10.0.1.11 edge nginx-edge-b
+10.0.1.12 internal nginx-internal-a

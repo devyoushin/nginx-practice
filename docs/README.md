@@ -13,3 +13,9 @@ Nginx 학습 문서는 주제별로 나눠 관리합니다.
 | `operations/` | 로깅, 모니터링, 설정 분리, 부하 대응 |
 
 처음 읽을 문서는 `install/01_installation.md`입니다.
+
+## 실무 운영 문서
+
+- [24. 설정 분리와 운영 튜닝](operations/24_practical_tuning_and_split_conf.md)
+- [25. 운영 중 부하 발생 시 대응 방법](operations/25_production_overload_response.md)
+- [26. 무중단 배포와 빠른 롤백 운영](operations/26_zero_downtime_release.md)

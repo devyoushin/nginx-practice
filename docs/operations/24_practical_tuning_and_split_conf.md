@@ -538,6 +538,388 @@ sudo systemctl reload nginx
 
 ---
 
+## 실무 운영형 conf.d 분리 패턴
+
+실무에서는 파일을 많이 나누는 것보다 "변경 책임 단위"가 명확한 구조가 더 중요합니다.
+보통 아래 기준으로 나눕니다.
+
+| 디렉터리 | 책임 | 변경 주기 | 소유자 |
+|----------|------|-----------|--------|
+| `nginx.conf` | worker, events, http 전역 기본값 | 낮음 | 플랫폼/인프라 |
+| `upstream.d/` | 백엔드 서버 목록, keepalive, 로드밸런싱 | 중간 | 플랫폼/서비스 |
+| `conf.d/` | 도메인별 `server` 블록, routing 정책 | 높음 | 서비스 |
+| `snippets/` | 공통 header, timeout, TLS, logging 조각 | 낮음 | 플랫폼 |
+| `maps.d/` | `map`, canary, routing variable | 중간 | 플랫폼/서비스 |
+
+운영에서 권장하는 형태는 아래와 같습니다.
+
+```text
+/etc/nginx/
+├── nginx.conf
+├── maps.d/
+│   ├── 00-release-map.conf
+│   └── 10-maintenance-map.conf
+├── upstream.d/
+│   ├── 10-api-blue.conf
+│   ├── 10-api-green.conf
+│   └── 20-admin.conf
+├── snippets/
+│   ├── proxy-common.conf
+│   ├── proxy-timeout-api.conf
+│   ├── proxy-timeout-long.conf
+│   ├── security-headers.conf
+│   └── access-log-main.conf
+└── conf.d/
+    ├── 00-default.conf
+    ├── 10-api.example.com.conf
+    ├── 20-admin.example.com.conf
+    └── 90-internal-health.conf
+```
+
+숫자 prefix는 사람이 읽기 위한 규칙이기도 하지만, include 순서를 고정하는 역할도 합니다.
+특히 `map`은 `server`보다 먼저 로드되어야 하므로 `maps.d`를 `conf.d`보다 앞에 include합니다.
+
+```nginx
+# /etc/nginx/nginx.conf
+http {
+    include /etc/nginx/mime.types;
+    default_type application/octet-stream;
+
+    include /etc/nginx/snippets/access-log-main.conf;
+
+    include /etc/nginx/maps.d/*.conf;
+    include /etc/nginx/upstream.d/*.conf;
+    include /etc/nginx/conf.d/*.conf;
+}
+```
+
+`conf.d` 안에 `upstream`이나 `map`을 섞어 넣을 수도 있지만, 서비스가 많아지면 변경 영향 범위가 흐려집니다.
+운영에서는 `server` 블록은 `conf.d`, upstream은 `upstream.d`, 변수 분기는 `maps.d`로 분리하는 편이 추적하기 쉽습니다.
+
+---
+
+## nginx.conf는 최대한 얇게 유지
+
+`nginx.conf`는 전체 프로세스와 http 전역 기본값만 담당하게 두는 것이 좋습니다.
+서비스별 라우팅, upstream 서버, 도메인 정책을 `nginx.conf`에 계속 추가하면 reload 전 검토가 어려워집니다.
+
+```nginx
+# /etc/nginx/nginx.conf
+user nginx;
+worker_processes auto;
+worker_rlimit_nofile 65536;
+
+error_log /var/log/nginx/error.log warn;
+pid /run/nginx.pid;
+
+events {
+    worker_connections 4096;
+    multi_accept on;
+}
+
+http {
+    include /etc/nginx/mime.types;
+    default_type application/octet-stream;
+
+    server_tokens off;
+    sendfile on;
+    tcp_nopush on;
+    tcp_nodelay on;
+
+    keepalive_timeout 65s;
+    keepalive_requests 10000;
+
+    client_header_timeout 10s;
+    client_body_timeout 10s;
+    send_timeout 30s;
+    reset_timedout_connection on;
+
+    include /etc/nginx/snippets/access-log-main.conf;
+    include /etc/nginx/maps.d/*.conf;
+    include /etc/nginx/upstream.d/*.conf;
+    include /etc/nginx/conf.d/*.conf;
+}
+```
+
+`nginx.conf`에 두기 좋은 것:
+
+- `user`, `worker_processes`, `worker_rlimit_nofile`
+- `events`
+- `log_format`
+- `sendfile`, `tcp_nopush`, `tcp_nodelay`
+- 공통 timeout의 기본값
+- include 순서
+
+`nginx.conf`에 계속 넣지 않는 것이 좋은 것:
+
+- 특정 서비스의 `server_name`
+- 특정 API의 `location`
+- 특정 upstream 서버 IP
+- 임시 canary 비율
+- 장애 대응을 위한 임시 차단 정책
+
+---
+
+## 서비스별 conf.d 파일 예시
+
+서비스 하나가 여러 API path를 갖는 경우에도 `server` 블록 하나를 기준으로 파일을 나누는 편이 일반적입니다.
+예를 들어 `api.example.com`은 `conf.d/10-api.example.com.conf` 하나가 소유합니다.
+
+```nginx
+# /etc/nginx/conf.d/10-api.example.com.conf
+server {
+    listen 80;
+    server_name api.example.com;
+
+    include /etc/nginx/snippets/security-headers.conf;
+
+    location = /health {
+        access_log off;
+        return 200 "ok\n";
+    }
+
+    location /v1/orders/ {
+        include /etc/nginx/snippets/proxy-common.conf;
+        include /etc/nginx/snippets/proxy-timeout-api.conf;
+        proxy_pass http://orders_backend;
+    }
+
+    location /v1/payments/ {
+        include /etc/nginx/snippets/proxy-common.conf;
+        include /etc/nginx/snippets/proxy-timeout-api.conf;
+
+        proxy_next_upstream off;
+        proxy_pass http://payments_backend;
+    }
+
+    location /v1/reports/ {
+        include /etc/nginx/snippets/proxy-common.conf;
+        include /etc/nginx/snippets/proxy-timeout-long.conf;
+        proxy_pass http://reports_backend;
+    }
+}
+```
+
+이렇게 나누면 `api.example.com`의 변경은 한 파일에서 확인할 수 있고, 백엔드 서버 목록은 `upstream.d`에서 따로 관리할 수 있습니다.
+
+```nginx
+# /etc/nginx/upstream.d/10-orders.conf
+upstream orders_backend {
+    least_conn;
+    zone orders_backend 64k;
+
+    server 10.0.10.11:8080 max_fails=3 fail_timeout=10s;
+    server 10.0.10.12:8080 max_fails=3 fail_timeout=10s;
+
+    keepalive 100;
+}
+```
+
+```nginx
+# /etc/nginx/upstream.d/10-payments.conf
+upstream payments_backend {
+    zone payments_backend 64k;
+
+    server 10.0.20.11:8080 max_fails=2 fail_timeout=5s;
+    server 10.0.20.12:8080 max_fails=2 fail_timeout=5s;
+
+    keepalive 50;
+}
+```
+
+결제나 주문처럼 중복 요청이 위험한 API는 `proxy_next_upstream off`처럼 서비스 성격에 맞게 location에서 명시합니다.
+반대로 조회 API는 timeout, 502, 503 정도에 한해 재시도를 허용할 수 있습니다.
+
+---
+
+## snippet은 공통 설정을 숨기는 곳이 아니다
+
+snippet은 반복을 줄이는 데 유용하지만, 너무 많은 설정을 숨기면 실제 location 동작을 파악하기 어려워집니다.
+실무에서는 아래처럼 역할이 명확한 작은 파일로 둡니다.
+
+```nginx
+# /etc/nginx/snippets/proxy-common.conf
+proxy_http_version 1.1;
+proxy_set_header Host $host;
+proxy_set_header X-Real-IP $remote_addr;
+proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+proxy_set_header X-Forwarded-Proto $scheme;
+proxy_set_header X-Request-ID $request_id;
+proxy_set_header Connection "";
+```
+
+```nginx
+# /etc/nginx/snippets/proxy-timeout-api.conf
+proxy_connect_timeout 3s;
+proxy_send_timeout 30s;
+proxy_read_timeout 30s;
+```
+
+```nginx
+# /etc/nginx/snippets/proxy-timeout-long.conf
+proxy_connect_timeout 3s;
+proxy_send_timeout 60s;
+proxy_read_timeout 300s;
+```
+
+```nginx
+# /etc/nginx/snippets/security-headers.conf
+add_header X-Frame-Options SAMEORIGIN always;
+add_header X-Content-Type-Options nosniff always;
+add_header Referrer-Policy strict-origin-when-cross-origin always;
+```
+
+주의할 점:
+
+- `include snippets/proxy-common.conf`만 보고도 어떤 헤더가 들어가는지 팀이 알고 있어야 합니다.
+- snippet에 `proxy_pass`는 넣지 않는 편이 좋습니다. 실제 라우팅 대상이 숨겨집니다.
+- snippet에 `location`이나 `server` 블록을 넣으면 include 위치가 제한되어 실수가 늘어납니다.
+- 보안 헤더는 `add_header ... always`를 붙여 4xx/5xx에도 적용되게 합니다.
+
+---
+
+## map으로 환경별/배포별 분기 관리
+
+canary, maintenance, 특정 header 기반 라우팅은 `conf.d` 안에 직접 흩뿌리지 말고 `maps.d`로 분리합니다.
+
+```nginx
+# /etc/nginx/maps.d/00-release-map.conf
+split_clients "${remote_addr}${http_user_agent}" $release_group {
+    5%      green;
+    *       blue;
+}
+
+map $release_group $api_upstream {
+    green   api_green_backend;
+    default api_blue_backend;
+}
+```
+
+```nginx
+# /etc/nginx/conf.d/10-api.example.com.conf
+server {
+    listen 80;
+    server_name api.example.com;
+
+    location / {
+        include /etc/nginx/snippets/proxy-common.conf;
+        include /etc/nginx/snippets/proxy-timeout-api.conf;
+
+        add_header X-Release-Group $release_group always;
+        proxy_pass http://$api_upstream;
+    }
+}
+```
+
+이 구조의 장점:
+
+- canary 비율 변경은 `maps.d/00-release-map.conf`만 보면 됩니다.
+- 서비스 라우팅 파일에는 `proxy_pass http://$api_upstream`만 남습니다.
+- rollback은 `green` 비율을 0%로 낮추고 reload하면 됩니다.
+
+---
+
+## 환경별 설정 관리 방식
+
+운영에서는 보통 `dev`, `stage`, `prod`가 같은 파일 구조를 쓰고 값만 달라집니다.
+서버에 직접 편집하는 방식보다 Git에서 환경별 디렉터리를 관리하고 배포 시 `/etc/nginx`에 반영하는 방식이 추적하기 쉽습니다.
+
+```text
+nginx-config/
+├── common/
+│   ├── nginx.conf
+│   └── snippets/
+├── envs/
+│   ├── dev/
+│   │   ├── upstream.d/
+│   │   └── conf.d/
+│   ├── stage/
+│   │   ├── upstream.d/
+│   │   └── conf.d/
+│   └── prod/
+│       ├── maps.d/
+│       ├── upstream.d/
+│       └── conf.d/
+└── hosts/
+    └── nginx-edge-a/
+        └── conf.d/90-local-health.conf
+```
+
+배포 시에는 `common -> envs/prod -> hosts/<node>` 순서로 합쳐서 배포합니다.
+이 방식은 `ops/bulk-install/config-bundle.sample/`에서 사용하는 overlay 방식과도 맞습니다.
+
+실제 서버에는 최종 결과물만 둡니다.
+
+```text
+/etc/nginx/
+├── nginx.conf
+├── maps.d/
+├── upstream.d/
+├── snippets/
+└── conf.d/
+```
+
+서버에 직접 남기지 않는 것이 좋은 것:
+
+- `conf.d/app.conf.bak`
+- `conf.d/app.conf.20260101`
+- `conf.d/app.conf.disabled`
+- 사용하지 않는 오래된 upstream 파일
+
+nginx는 `*.conf`에 걸리는 파일을 모두 읽습니다.
+백업 파일이 `.conf`로 끝나면 의도치 않게 설정이 같이 로드될 수 있습니다.
+
+---
+
+## 변경 반영과 롤백 절차
+
+운영에서 설정을 반영할 때는 파일 복사보다 검증 순서가 더 중요합니다.
+
+```bash
+# 1. 새 설정을 임시 디렉터리에 구성
+sudo rm -rf /tmp/nginx-next
+sudo mkdir -p /tmp/nginx-next
+sudo cp -a /etc/nginx/. /tmp/nginx-next/
+
+# 2. 변경 파일 반영
+sudo cp 10-api.example.com.conf /tmp/nginx-next/conf.d/
+
+# 3. 임시 디렉터리 기준으로 문법 검사
+sudo nginx -t -p /tmp/nginx-next/ -c nginx.conf
+
+# 4. 현재 설정 백업
+sudo cp -a /etc/nginx "/etc/nginx.backup.$(date +%Y%m%d%H%M%S)"
+
+# 5. 실제 경로 반영
+sudo cp -a /tmp/nginx-next/. /etc/nginx/
+
+# 6. 실제 경로에서 다시 검사 후 reload
+sudo nginx -t
+sudo systemctl reload nginx
+```
+
+롤백은 백업 디렉터리를 다시 복사하고 reload합니다.
+
+```bash
+sudo rm -rf /etc/nginx
+sudo cp -a /etc/nginx.backup.20260615123000 /etc/nginx
+sudo nginx -t
+sudo systemctl reload nginx
+```
+
+reload 후 확인:
+
+```bash
+sudo nginx -T | grep -n "server_name api.example.com" -A80
+curl -I http://api.example.com/health
+tail -f /var/log/nginx/error.log
+```
+
+`reload`는 기존 worker를 바로 죽이지 않고 새 worker를 띄운 뒤 기존 연결을 정리합니다.
+그래도 설정 오류나 upstream 오타는 서비스 장애로 이어질 수 있으므로 `nginx -t`, `nginx -T`, health check를 항상 묶어서 봅니다.
+
+---
+
 ## 검증 절차
 
 운영 반영 전 최소 절차:
@@ -587,6 +969,9 @@ wrk -t4 -c100 -d30s http://api.example.com/api/users
 [ ] 스트리밍/SSE/WebSocket은 proxy_buffering off 또는 별도 설정
 [ ] 정적 파일은 nginx에서 직접 처리
 [ ] 헬스 체크와 정적 파일 access log 제외
+[ ] nginx.conf, maps.d, upstream.d, conf.d, snippets 책임 분리
+[ ] conf.d에는 server 블록 중심으로 구성
+[ ] 백업 파일이 *.conf 패턴에 걸리지 않는지 확인
 [ ] nginx -t 통과
 [ ] nginx -T로 include 결과 확인
 [ ] reload 후 4xx/5xx, 응답 시간, fd, CPU 확인

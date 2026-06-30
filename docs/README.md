@@ -6,7 +6,7 @@ Nginx 학습 문서는 주제별로 나눠 관리합니다.
 |------|------|
 | `install/` | 설치, 패키지, systemd 기본 실행 |
 | `architecture/` | Master/Worker 구조, 이벤트 처리 |
-| `config/` | nginx.conf 구조, context, server/location, 변수, rewrite |
+| `config/` | nginx.conf 구조, context, server/location, 변수, rewrite, 자주 쓰는 모듈 |
 | `proxy/` | upstream, reverse proxy, FastCGI, WebSocket, stream |
 | `security/` | TLS, 보안 헤더, rate limiting |
 | `performance/` | 캐싱, gzip, OS/Nginx 튜닝 |
